@@ -131,9 +131,17 @@ def _first_value(record: Dict[str, Any], candidates: List[str]) -> Any:
 
 
 def _parse_datetime(value: Any) -> Optional[datetime]:
+    """API 的 DateTime 是 YYYYMMDDHHMMSS，例如 20261012194200。"""
     if value is None:
         return None
     try:
+        text = str(value).strip()
+        # 先按 API 明確定義的 14 位日期時間解析，避免被當成 Unix 奈秒而變成 1970 年。
+        if text.endswith(".0"):
+            text = text[:-2]
+        if len(text) == 14 and text.isdigit():
+            dt = datetime.strptime(text, "%Y%m%d%H%M%S")
+            return tw_tz.localize(dt)
         dt = pd.to_datetime(value, errors="coerce")
         if pd.isna(dt):
             return None
@@ -150,7 +158,7 @@ def _find_records(payload: Any) -> List[Dict[str, Any]]:
     found: List[Dict[str, Any]] = []
     time_keys = ["DateTime", "datetime", "ObservationTime", "ObsTime", "time", "Time"]
     tide_keys = [
-        "Tide_TWVD_m", "Tide_CDL_m", "Tide_REF_m",
+        "Tide_TWD_m", "Tide_TWVD_m", "Tide_CDL_m", "Tide_REF_m",
         "Tide", "TideHeight", "tide_height", "潮位", "潮高",
     ]
 
@@ -174,7 +182,7 @@ def _find_records(payload: Any) -> List[Dict[str, Any]]:
     unique: Dict[str, Dict[str, Any]] = {}
     for item in found:
         key = str(_first_value(item, time_keys)) + "|" + str(
-            _first_value(item, ["Tide_TWVD_m", "Tide_CDL_m", "Tide_REF_m", "Tide", "TideHeight", "潮位", "潮高"])
+            _first_value(item, ["Tide_TWD_m", "Tide_TWVD_m", "Tide_CDL_m", "Tide_REF_m", "Tide", "TideHeight", "潮位", "潮高"])
         )
         unique[key] = item
     return list(unique.values())
@@ -194,17 +202,19 @@ def _normalise_records(payload: Any) -> List[Dict[str, Any]]:
             continue
         row: Dict[str, Any] = {"觀測時間": dt}
         for field, aliases in {
-            "TWVD": ["Tide_TWVD_m"],
+            "TWD": ["Tide_TWD_m"],
             "CDL": ["Tide_CDL_m"],
             "REF": ["Tide_REF_m"],
         }.items():
             value = _first_value(record, aliases)
             try:
-                row[field] = float(value) if value not in (None, "") else None
+                numeric = float(value) if value not in (None, "") else None
+                # API 用 -999 表示無效/缺測值，不可當成真實潮位。
+                row[field] = None if numeric is None or numeric == -999 else numeric
             except (TypeError, ValueError):
                 row[field] = None
         # 若 API 回傳使用非標準欄位，保留通用潮位欄位作備援
-        if all(row.get(k) is None for k in ("TWVD", "CDL", "REF")):
+        if all(row.get(k) is None for k in ("TWD", "CDL", "REF")):
             value = _first_value(
                 record, ["Tide", "TideHeight", "tide_height", "潮位", "潮高"]
             )
@@ -276,108 +286,69 @@ if not observations:
     )
     st.stop()
 
-# 以資料中可用的垂直基準選擇潮位欄位
-available_datums = [
-    datum for datum in ("TWVD", "CDL", "REF")
-    if any(row.get(datum) is not None for row in observations)
-]
-if available_datums:
-    preferred_index = available_datums.index("CDL") if "CDL" in available_datums else 0
-    selected_datum = st.selectbox(
-        "潮位垂直基準（需與航道水深基準一致）",
-        available_datums,
-        index=preferred_index,
-        help="請依航道水深資料的垂直基準選擇。若基準不同，UKC 數值可能不具可比性。",
-    )
-    tide_column = selected_datum
-else:
-    tide_column = "其他潮位欄位"
-    if not any(row.get(tide_column) is not None for row in observations):
-        st.error("觀測紀錄中沒有可用的潮位數值，無法計算 UKC。")
-        st.stop()
-    st.warning("API 未提供已識別的 TWVD/CDL/REF 欄位，請先確認潮位基準。")
-
-usable = [row for row in observations if row.get(tide_column) is not None]
+# API 的三種欄位是不同高程/潮位基準，不可任意互換。
+# 這裡以 REF 作為觀測值展示，TWD/CDL 同時列出供核對；在確認航道水深基準前暫停 UKC 數值計算。
+usable = [row for row in observations if row.get("REF") is not None]
 if not usable:
-    st.error(f"觀測資料中沒有可用的 {tide_column} 潮位數值，無法計算 UKC。")
+    st.error("目前沒有有效的 Tide_REF_m 觀測值（API 的 -999 代表缺測），請稍後重試。")
     st.stop()
 
 latest = usable[-1]
 latest_time = latest["觀測時間"]
-latest_tide = float(latest[tide_column])
-available_depth = channel_depth + latest_tide
-ukc = available_depth - draft
-ukc_pct = (ukc / draft) * 100 if draft > 0 else 0.0
-
-if ukc_pct >= 15.0:
-    current_status = "GREEN"
-    status_text = "🟢 初步估算：UKC 裕度達 15% 門檻"
-elif ukc_pct >= 10.0:
-    current_status = "YELLOW"
-    status_text = "🟡 初步估算：UKC 裕度介於 10% 至 15%"
-else:
-    current_status = "RED"
-    status_text = "🔴 初步估算：UKC 裕度低於 10% 門檻"
-
-bg_color_map = {
-    "GREEN": "#e8f8f5",
-    "YELLOW": "#fef9e7",
-    "RED": "#fadbd8",
-}
-bg_color = bg_color_map[current_status]
-st.markdown(
-    f""" <style> .stApp {{ background-color: {bg_color}; transition: background-color 0.5s ease; }} </style> """,
-    unsafe_allow_html=True,
-)
+latest_ref = float(latest["REF"])
 
 st.subheader("🌊 最新實際觀測潮位")
 c1, c2 = st.columns(2)
 with c1:
-    st.metric("最新觀測潮位", f"{latest_tide:.2f} m")
-    st.caption(f"基準：{tide_column}")
+    st.metric("相對潮位 Tide_REF_m", f"{latest_ref:.3f} m")
 with c2:
     st.metric("觀測時間", latest_time.strftime("%Y-%m-%d %H:%M:%S"))
 st.caption(
-    "此時間是資料來源所提供的觀測時間，不一定等於目前時間；請留意資料更新頻率。"
+    "時間已按 API 的 YYYYMMDDHHMMSS 格式解析。Tide_REF_m 僅先用於觀測值展示；"
+    "在確認航道設計水深與潮位基準一致前，不把它加到設計水深中。"
 )
 
-st.subheader("⚓ 依最新觀測值估算 UKC")
-st.write(status_text)
-m1, m2, m3 = st.columns(3)
-m1.metric("可用水深（初步估算）", f"{available_depth:.2f} m")
-m2.metric("UKC（初步估算）", f"{ukc:.2f} m")
-m3.metric("UKC 裕度", f"{ukc_pct:.1f}%")
+st.subheader("🧭 其他潮位欄位（分開呈現，不互相替代）")
+latest_fields = []
+for label, key, meaning in [
+    ("Tide_TWD_m", "TWD", "中潮系統潮位"),
+    ("Tide_CDL_m", "CDL", "築港高程系統潮位高程"),
+    ("Tide_REF_m", "REF", "相對潮位"),
+]:
+    value = latest.get(key)
+    latest_fields.append({
+        "API 欄位": label,
+        "說明": meaning,
+        "最新值 (m)": round(float(value), 3) if value is not None else "缺測",
+    })
+st.dataframe(pd.DataFrame(latest_fields), use_container_width=True, hide_index=True)
 
+st.subheader("⚓ UKC 計算狀態")
 st.warning(
-    "基準與安全提醒：以上 UKC 只以「航道設計水深 + 最新觀測潮位 − 靜態吃水」估算。"
-    "使用前必須確認航道水深與所選潮位的垂直基準一致，並核對航道官方水深、"
-    "潮位資料品質及船舶/港口規定。本頁狀態顏色不代表正式航行許可。"
+    "目前暫停顯示 UKC、可用水深及安全燈號：尚未確認高雄港第二航道與基隆港的"
+    "設計水深所採用的垂直基準，是否與 API 的 Tide_TWD_m、Tide_CDL_m 或 Tide_REF_m 一致。"
+    "若直接把不同基準的數值相加，可能產生錯誤且具誤導性的 UKC。"
 )
+st.write(f"**航道設計水深（待核對基準）：** {channel_depth:.2f} m")
+st.write(f"**船舶靜態吃水：** {draft:.2f} m")
+st.caption("Squat 已停用。確認兩者垂直基準一致後，再恢復 UKC 計算。")
 
-# --- 5. 僅呈現 API 實際提供的觀測紀錄，不生成未來值 ---
-st.subheader("📈 已取得的實際觀測潮位資料")
-plot_rows = []
-for row in usable:
-    tide = float(row[tide_column])
-    plot_rows.append(
-        {
-            "觀測時間": row["觀測時間"],
-            "觀測潮位 (m)": tide,
-            "可用水深初步估算 (m)": channel_depth + tide,
-        }
-    )
-
+st.subheader("📈 實際觀測相對潮位紀錄")
+plot_rows = [
+    {"觀測時間": row["觀測時間"], "相對潮位 Tide_REF_m (m)": float(row["REF"])}
+    for row in usable
+]
 df_observations = pd.DataFrame(plot_rows).set_index("觀測時間")
-st.line_chart(df_observations[["觀測潮位 (m)", "可用水深初步估算 (m)"]])
+st.line_chart(df_observations)
 
 st.subheader("📊 實際觀測資料明細")
 display_rows = []
-for row in usable:
+for row in observations:
     item = {
         "觀測時間": row["觀測時間"].strftime("%Y-%m-%d %H:%M:%S"),
-        f"潮位 {tide_column} (m)": row[tide_column],
-        "可用水深初步估算 (m)": round(channel_depth + float(row[tide_column]), 2),
-        "UKC 初步估算 (m)": round(channel_depth + float(row[tide_column]) - draft, 2),
+        "Tide_TWD_m 中潮系統 (m)": row.get("TWD"),
+        "Tide_CDL_m 築港高程 (m)": row.get("CDL"),
+        "Tide_REF_m 相對潮位 (m)": row.get("REF"),
     }
     if row.get("備註"):
         item["備註"] = row["備註"]
@@ -385,6 +356,6 @@ for row in usable:
 st.dataframe(pd.DataFrame(display_rows), use_container_width=True, hide_index=True)
 
 st.info(
-    f"目前 API 回傳並成功辨識 {len(usable)} 筆觀測紀錄。"
-    "本系統不會將這些觀測值外推成未來 24 小時預報，也不會提供未來潮窗推算。"
+    f"API 回傳並解析 {len(observations)} 筆紀錄，其中 {len(usable)} 筆有有效的 Tide_REF_m。"
+    "本系統只顯示實際觀測值，不將觀測值外推成未來 24 小時預報，也不推算未來潮窗。"
 )
