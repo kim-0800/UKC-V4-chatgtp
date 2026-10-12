@@ -4,8 +4,36 @@ from typing import Any, Dict, List, Optional
 import pandas as pd
 import pytz
 import requests
+import ssl
+from requests.adapters import HTTPAdapter
+from urllib3.poolmanager import PoolManager
 import streamlit as st
 from streamlit_js_eval import get_geolocation
+
+
+class CompatibleTLSAdapter(HTTPAdapter):
+    """放寬 OpenSSL 的 X.509 strict 檢查，但仍保留憑證驗證與主機名稱驗證。"""
+    def __init__(self, *args, **kwargs):
+        self.ssl_context = ssl.create_default_context()
+        strict_flag = getattr(ssl, "VERIFY_X509_STRICT", 0)
+        if strict_flag:
+            self.ssl_context.verify_flags &= ~strict_flag
+        super().__init__(*args, **kwargs)
+
+    def init_poolmanager(self, connections, maxsize, block=False, **pool_kwargs):
+        pool_kwargs["ssl_context"] = self.ssl_context
+        self.poolmanager = PoolManager(
+            num_pools=connections,
+            maxsize=maxsize,
+            block=block,
+            **pool_kwargs,
+        )
+
+
+def make_tide_session():
+    session = requests.Session()
+    session.mount("https://", CompatibleTLSAdapter())
+    return session
 
 # 頁面基本設定
 st.set_page_config(
@@ -196,7 +224,8 @@ def _normalise_records(payload: Any) -> List[Dict[str, Any]]:
 def fetch_observed_tide(port: str) -> Dict[str, Any]:
     """取得港灣環境資訊網觀測潮位；不建立或補造任何預報值。"""
     try:
-        response = requests.get(
+        session = make_tide_session()
+        response = session.get(
             TIDE_API_URL,
             params={"format": "JSON", "port": port},
             headers={
