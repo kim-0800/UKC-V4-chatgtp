@@ -2,3 +2,5 @@ streamlit>=1.32
 pandas>=2.0
 requests>=2.31
 streamlit-js-eval
+beautifulsoup4>=4.12
+lxml>=5.0
